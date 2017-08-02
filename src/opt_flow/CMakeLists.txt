@@ -12,11 +12,12 @@ find_package(catkin REQUIRED COMPONENTS
   cv_bridge
   roscpp
   std_msgs
+  opencv_apps
 )
 
 ## System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
-
+find_package(OpenCV 3 REQUIRED)
 
 ## Uncomment this if the package has a setup.py. This macro ensures
 ## modules and global scripts declared therein get installed
@@ -119,6 +120,8 @@ catkin_package(
 include_directories(
 # include
   ${catkin_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
+  /home/shimizulab/OptFrow_WS/src/opt_flow/include/
 )
 
 ## Declare a C++ library
@@ -153,6 +156,7 @@ add_executable(opt_flow src/main.cpp)
 #   ${catkin_LIBRARIES}
 # )
 target_link_libraries(opt_flow ${catkin_LIBRARIES})
+target_link_libraries(opt_flow ${OpenCV_LIBRARIES})
 
 
 #############

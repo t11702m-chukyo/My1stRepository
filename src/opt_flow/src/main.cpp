@@ -2,10 +2,14 @@
 #include <image_transport/image_transport.h>
 #include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/image_encodings.h>
+
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/superres/optical_flow.hpp>
 #include <opencv2/opencv.hpp>
+#include <opencv2/core/core.hpp>
+
+#include <opt_flow/Labeling.h>
 
 static const std::string OPENCV_WINDOW = "Image window";
 using namespace cv;
@@ -17,7 +21,7 @@ class ImageConverter
   image_transport::ImageTransport it_;
   image_transport::Subscriber image_sub_;
   image_transport::Publisher image_pub_;
-  Mat prev;
+  cv::Mat PreImg;
   Ptr<DenseOpticalFlowExt> opticalFlow = superres::createOptFlow_DualTVL1();
 
 public:
@@ -37,97 +41,102 @@ public:
     cv::destroyWindow(OPENCV_WINDOW);
   }
 
-// add
-	void visualizeFarnebackFlow(
-    const Mat& flow,    //オプティカルフロー CV_32FC2
-    Mat& visual_flow    //可視化された画像 CV_32FC3
-	)
-	{
-    visual_flow = Mat::zeros(flow.rows, flow.cols, CV_32FC3);
-    int flow_ch = flow.channels();
-    int vis_ch = visual_flow.channels();//3のはず
-    for(int y = 0; y < flow.rows; y++) {
-        float* psrc = (float*)(flow.data + flow.step * y);
-        float* pdst = (float*)(visual_flow.data + visual_flow.step * y);
-        for(int x = 0; x < flow.cols; x++) {
-            float dx = psrc[0];
-            float dy = psrc[1];
-            float r = (dx < 0.0) ? abs(dx) : 0;
-            float g = (dx > 0.0) ? dx : 0;
-            float b = (dy < 0.0) ? abs(dy) : 0;
-            r += (dy > 0.0) ? dy : 0;
-            g += (dy > 0.0) ? dy : 0;
- 
-            pdst[0] = b;
-            pdst[1] = g;
-            pdst[2] = r;
- 
-            psrc += flow_ch;
-            pdst += vis_ch;
-        }
-    }
-	}
-
-
   void imageCb(const sensor_msgs::ImageConstPtr& msg)
   {
-    cv_bridge::CvImagePtr cv_ptr;
+    // 入力画像の取得
+    cv_bridge::CvImagePtr InImgRos;
     try
     {
-      cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+      InImgRos = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
     }
     catch (cv_bridge::Exception& e)
     {
       ROS_ERROR("cv_bridge exception: %s", e.what());
       return;
     }
-    // ######### 0529 add -start #########
-    cv_bridge::CvImage gray;
-    cv::Mat curr;
-    cv::cvtColor(cv_ptr->image, gray.image, CV_BGR2GRAY);
 
-    curr = gray.image.clone();
-    cv::resize( curr, curr, cv::Size(), 0.5, 0.5 );
+    // Optical Flow ====================================================================
+    // グレイスケール変換
+    cv_bridge::CvImage GrayImgRos;
+    cv::Mat GrayImg;
+    cv::cvtColor(InImgRos->image, GrayImgRos.image, CV_BGR2GRAY);
+
+    // オプティカルフロー用の画像（1/10倍のりサイズ+グレイスケール）の作成
+    GrayImg = GrayImgRos.image.clone();
+    cv::resize( GrayImg, GrayImg, cv::Size(), 0.1, 0.1 );
+    int width   = GrayImg.cols;
+    int height  = GrayImg.rows;
+    // =================================================================================
       
-    if(prev.empty()) prev = curr.clone();
-    // オプティカルフローの計算
-		Mat flowX, flowY;
-		opticalFlow->calc(prev, curr, flowX, flowY);
+    // Optical Flow ====================================================================
+    if(PreImg.empty()) PreImg = GrayImg.clone();
+		cv::Mat flowX, flowY;
+		cv::Mat magnitude, angle;
+		cv::Mat hsvPlanes[3];		
+		cv::Mat hsv;
+		cv::Mat flowBgr;
+    cv::Mat BinImg = cv::Mat::zeros(height, width, CV_8U);
+    int WhiteNum;
 
-		// オプティカルフローの可視化（色符号化）
-		//  オプティカルフローを極座標に変換（角度は[deg]）
-		Mat magnitude, angle;
+    // オプティカルフローの算出
+		opticalFlow->calc(PreImg, GrayImg, flowX, flowY);
+
+		// オプティカルフローの強度画像(magnitude)の作成
 		cartToPolar(flowX, flowY, magnitude, angle, true);
-		//  色相（H）はオプティカルフローの角度
-		//  彩度（S）は0～1に正規化したオプティカルフローの大きさ
-		//  明度（V）は1
-		Mat hsvPlanes[3];		
-		hsvPlanes[0] = angle;
 		normalize(magnitude, magnitude, 0, 1, NORM_MINMAX); // 正規化
-		hsvPlanes[1] = magnitude;
-		hsvPlanes[2] = Mat::ones(magnitude.size(), CV_32F);
-		//  HSVを合成して一枚の画像にする
-		Mat hsv;
-		merge(hsvPlanes, 3, hsv);
-		//  HSVからBGRに変換
-		Mat flowBgr;
-		cvtColor(hsv, flowBgr, cv::COLOR_HSV2BGR);
 
-		// 表示
-		cv::imshow("input", curr);
-		cv::imshow("optical flow", flowBgr);
+    // オプティカルフローの強度画像の2値化
+    WhiteNum = 0;
+    for(int j = 0; j < height; j++){
+      for(int i = 0; i < width; i++){
+        if(0.5 < magnitude.at<float>(j, i)){
+          BinImg.at<unsigned char>(j, i) = 255;
+          WhiteNum++;
+        }
+      }
+    }
+
+    // 強度画像の補正（穴埋め）
+    cv::dilate(BinImg, BinImg, cv::Mat(), cv::Point(-1, -1), 3); // クロージングを3回実施
+    cv::erode(BinImg, BinImg, cv::Mat(), cv::Point(-1, -1), 3);  // オープニングを3回実施
+
+    // =================================================================================
+
+    // 物体領域の表示 ========================================================================
+    short         *LabelImg = new short[width*height];  // ラベリング結果
+    int           min_size = 20;                        // 最小セグメントのサイズ
+    bool          labeling_flag;                        // ラベリング実行の有無を示すフラグ（）
+    cv::Mat ResImg = InImgRos->image.clone();           // 物体検出結果 
+    cv::Point     bb_pos1;                              // Bounding Boxの左上の位置
+    cv::Point     bb_pos2;                              // Bounding Boxの右下の位置
+    LabelingBS    labeling;                             // ラベリング結果
+    RegionInfoBS  *ri;
+
+    if(min_size < WhiteNum) labeling_flag = true;
+    else                    labeling_flag = false;
+
+    if(labeling_flag){
+      // Labeling の実行
+      labeling.Exec((unsigned char *)BinImg.data, LabelImg, width, height, true, min_size);
+
+      // 最大サイズのセグメントのBounding Boxの位置(bb_pos)を取得
+      ri = labeling.GetResultRegionInfo(0); // 最大サイズのセグメントのみの情報を取得
+      ri->GetMin(bb_pos1.x, bb_pos1.y);
+      ri->GetMax(bb_pos2.x, bb_pos2.y);
+
+      // 物体検出結果の表示
+      bb_pos1.x = bb_pos1.x*10; bb_pos1.y = bb_pos1.y*10;;
+      bb_pos2.x = bb_pos2.x*10; bb_pos2.y = bb_pos2.y*10;;
+      cv::rectangle( ResImg, bb_pos1, bb_pos2, cv::Scalar(0, 255, 255), 1, 8, 0 );
+    }
+    // =================================================================================
 
 		// 前のフレームを保存
-		prev = curr;
+		PreImg = GrayImg;
 
-    // Update GUI Window
-    //cv::imshow(OPENCV_WINDOW, gray.image);
-    cv::waitKey(3);
-
-    // Output modified video stream
-    //image_pub_.publish(gray2.toImageMsg()); \\ COLOR
-    image_pub_.publish(cv_bridge::CvImage(std_msgs::Header(), "mono8", gray.image).toImageMsg()); // GRAYSCALE
-
+		// 表示
+    cv::imshow("result", ResImg);
+    cv::waitKey(1);
   }
 };
 
